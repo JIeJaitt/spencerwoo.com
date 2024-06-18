@@ -1,0 +1,504 @@
+---
+title: Gorm wrapper
+date: 2022-05-25T00:00:00.000Z
+tags: ['Gorm', 'open-source']
+draft: false
+summary: 请你帮我阅读这段比较复杂的代码，我有点分不清其中的状态流转：
+layout: PostSimple
+---
+
+请你帮我阅读这段比较复杂的代码，我有点分不清其中的状态流转：
+```go
+func (s *Service) buildNoteOrderListScopes(ctx context.Context, reqParams notemapping.NoteOrderListParams) ([]dao.Scope, []dao.Scope, error) {
+	var scopes []dao.Scope
+
+	// 跨表条件
+	if reqParams.SearchValue != "" {
+		scopes = append(scopes, func(db *gorm.DB) *gorm.DB {
+			db = db.Where(s.DBAccessor.DB().
+				Or(tradedb.TNoteOrderTableName + "." + tradedb.TNoteOrderColumn.ISIN + " like '%" + reqParams.SearchValue + "%'").
+				Or(tradedb.TNoteOrderTableName + "." + tradedb.TNoteOrderColumn.OrderNumber + " like '%" + reqParams.SearchValue + "%'").
+				Or(tradedb.TNoteOrderColumn.NoteInfo + "." + tradedb.TNoteOrderColumn.ProductCode + " like '%" + reqParams.SearchValue + "%'"),
+			)
+
+			return db
+		})
+	}
+
+	// models search wrapper
+	orderWrapper := tradedbdao.NoteOrderSearchWrapper{}
+	orderNoteInfoWrapper := tradedbdao.NoteOrderExtraInfoSearchWrapper{}
+
+	if reqParams.UserId != "" {
+		orderWrapper.InstitutionUserId = null.StringFrom(reqParams.UserId)
+	}
+
+	if reqParams.NoteTypes != "" {
+		for _, s := range strings.Split(reqParams.NoteTypes, ",") {
+			parseInt, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "parse NoteTypes failed")
+			}
+
+			orderNoteInfoWrapper.ProductTypes = append(orderNoteInfoWrapper.ProductTypes, int(parseInt))
+		}
+	}
+
+	// OrderStatus 是一个复杂条件
+	// https://www.tapd.cn/60236733/markdown_wikis/show/#1160236733001005964
+	if reqParams.OrderStatus != "" {
+		for _, status := range strings.Split(reqParams.OrderStatus, ",") {
+			parseInt, err := strconv.ParseInt(status, 10, 64)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "parse OrderStatus failed")
+			}
+
+			frontOrderStatus := orderconstant.FrontNoteOrderStatus(parseInt)
+
+			if _, exists := orderconstant.FrontNoteOrderStatusSet[frontOrderStatus]; !exists {
+				return nil, nil, errors.Wrap(err, "OrderStatus not found")
+			}
+
+			switch frontOrderStatus {
+			case orderconstant.FrontNoteOrderStatusCashHolding:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusInitial}
+			case orderconstant.FrontNoteOrderStatusWaitAudit:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusWaitAudit}
+			case orderconstant.FrontNoteOrderStatusCancel:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusCancelBeforeAudit, orderconstant.NoteOrderStatusCancelAfterAudit}
+			case orderconstant.FrontNoteOrderStatusWaiting:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusWaiting}
+			case orderconstant.FrontNoteOrderStatusConfirm:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusConfirm, orderconstant.NoteOrderStatusSettled}
+			case orderconstant.FrontNoteOrderStatusProcessing:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusAccepted, orderconstant.NoteOrderStatusConsolidate}
+			case orderconstant.FrontNoteOrderStatusFail:
+				orderWrapper.OrderStatusList = []orderconstant.NoteOrderStatus{orderconstant.NoteOrderStatusFail, orderconstant.NoteOrderStatusAuditReject}
+			}
+		}
+	}
+
+	if !reqParams.FromAcceptDateAfterParse.IsZero() && !reqParams.ToAcceptDateDateAfterParse.IsZero() {
+		orderWrapper.GeAcceptTime = null.TimeFrom(reqParams.FromAcceptDateAfterParse)
+		orderWrapper.LeAcceptTime = null.TimeFrom(reqParams.ToAcceptDateDateAfterParse.AddDate(0, 0, 1))
+	}
+
+	// for count
+	wrapperForCount := orderWrapper
+	searchCountScopes := append(scopes, s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo)), wrapperForCount.GormSearch())
+
+	if reqParams.Start != nil {
+		orderWrapper.Start = *reqParams.Start
+	}
+	if reqParams.Count != nil {
+		orderWrapper.Count = *reqParams.Count
+	}
+
+	if reqParams.Sort != nil {
+		if *reqParams.Sort == -1 {
+			orderWrapper.Sort = null.StringFrom("submitTime desc")
+		} else {
+			orderWrapper.Sort = null.StringFrom("submitTime")
+		}
+	} else {
+		orderWrapper.Sort = null.StringFrom("submitTime")
+	}
+
+	searchListScopes := append(scopes, s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo)), s.NoteOrderDao.PreLoadThirdRequestsWithScopes(), orderWrapper.GormSearch())
+
+	return searchListScopes, searchCountScopes, nil
+}
+```
+
+这段代码定义了一个名为 `buildNoteOrderListScopes` 的函数，它是在一个名为 `Service` 的结构体上的方法。该函数的目的是根据传入的请求参数 `reqParams` 构建搜索条件（作用域）列表，这些列表将用于数据库查询。返回的是两个搜索条件列表和一个错误信息。
+
+这里是代码逻辑的概述和一些关键点的解释：
+
+1. **初始化搜索作用域**：函数开始时初始化一个名为 `scopes` 的 `dao.Scope` 列表，这将用于存储所有的数据库查询条件。
+
+2. **跨表搜索条件**：
+   - 如果 `reqParams.SearchValue` 非空，函数会添加一个搜索条件，该条件针对订单的 ISIN、订单号以及产品编码进行模糊匹配。
+
+3. **包装器初始化**：
+   - `orderWrapper` 和 `orderNoteInfoWrapper` 是用来存储不同的搜索参数，这些参数稍后会用来生成查询条件。
+
+4. **用户ID过滤**：
+   - 如果 `reqParams.UserId` 非空，`orderWrapper` 会被设置一个用户ID条件。
+
+5. **票据类型过滤**：
+   - 根据 `reqParams.NoteTypes`（一个以逗号分隔的字符串），解析每一种票据类型，并添加到 `orderNoteInfoWrapper`。
+
+6. **订单状态过滤**：
+   - 根据 `reqParams.OrderStatus`（一个以逗号分隔的字符串），解析每一种状态。每种状态对应不同的数据库中的状态值。
+   - 有一个映射 `orderconstant.FrontNoteOrderStatusSet` 检查状态是否有效。
+   - 根据解析出的状态，设置相应的订单状态到 `orderWrapper`。
+
+7. **接受日期过滤**：
+   - 如果接受日期 `FromAcceptDateAfterParse` 和 `ToAcceptDateDateAfterParse` 都非空，设置时间范围过滤。
+
+8. **用于计数的搜索条件**：
+   - `wrapperForCount` 是 `orderWrapper` 的一个副本，它被用于构造计数查询（可能用于分页）。
+   - `searchCountScopes` 包括了用于联结订单信息和过滤条件的作用域。
+
+9. **分页和排序**：
+   - 如果 `reqParams.Start` 和 `reqParams.Count` 非空，它们将被设置到 `orderWrapper` 以用于分页。
+   - `reqParams.Sort` 用于设置排序参数，如果是 `-1` 则降序排序，否则升序。
+
+10. **返回值**：
+   - `searchListScopes` 和 `searchCountScopes` 分别返回用于查询订单列表和订单计数的搜索条件列表。
+   - 如果过程中有错误发生，如解析状态或类型出错，函数将提前返回错误。
+
+这段代码涉及到许多不同的数据库表和字段，以及复杂的条件逻辑，主要用于构建高度定制的数据库查询。
+
+这一句代码是什么意思？
+```go
+searchListScopes := append(scopes, s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo)), s.NoteOrderDao.PreLoadThirdRequestsWithScopes(), orderWrapper.GormSearch())
+```
+
+这行代码是在构建一个名为 `searchListScopes` 的作用域列表，这个列表最终用于执行数据库查询操作。具体来说，它在已经存在的 `scopes` 列表的基础上，追加了几个额外的作用域，用于定制化查询。下面是各个部分的具体作用：
+
+1. **s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo))**：
+   - 这部分代码通过 `JoinNoteInfoWithScopes` 方法，加入了额外的作用域，这些作用域是由 `orderNoteInfoWrapper.GormSearchOnFieldName` 方法生成的。`GormSearchOnFieldName` 方法根据提供的字段名 `tradedb.TNoteOrderColumn.NoteInfo` 来构建搜索条件，这通常涉及到关联查询，即结合票据信息表（note info）的数据进行查询。
+
+2. **s.NoteOrderDao.PreLoadThirdRequestsWithScopes()**：
+   - `PreLoadThirdRequestsWithScopes` 方法可能是用于预加载与订单相关的第三方请求数据。这通常在 ORM (Object-Relational Mapping) 框架中用于优化性能，通过一次查询解决潜在的N+1查询问题，即在获取订单信息时同时获取所有相关的第三方请求信息。
+
+3. **orderWrapper.GormSearch()**：
+   - `orderWrapper.GormSearch` 产生基于 `orderWrapper` 中设置的过滤条件的作用域。这可能包括过滤用户ID、订单状态、票据类型等，具体取决于 `orderWrapper` 中设置的属性。
+
+综合上述，`searchListScopes` 通过合并这些不同的查询作用域，构建了一个复合查询，这个查询涵盖了基本过滤条件、关联信息加载以及额外的订单信息加载。这样的设计模式允许高效地进行数据库操作，同时确保查询的数据完整性和查询性能。
+
+## 如果打印这个searchListScopes 会是什么样子
+
+`searchListScopes` 是一个包含多个 `dao.Scope` 类型元素的列表，每个 `dao.Scope` 实际上是一个函数，这些函数接受一个 `gorm.DB` 类型的参数并返回一个同样类型的结果。这些函数定义了如何修改数据库查询，如添加条件、联接表等。
+
+由于 `searchListScopes` 中的元素都是函数，如果直接打印这个列表，你通常不会看到具体的查询或条件，而是看到每个函数的内存地址或者表示函数存在的某种标识。这不会提供关于查询内容的实际信息。在 Go 语言中，函数直接打印可能类似于以下形式：
+
+```plaintext
+[0x10438290, 0x10438291, 0x10438292]
+```
+
+这些是函数指针的地址，每个地址代表列表中一个特定的查询作用域（`dao.Scope`）。 若要查看实际的查询构造或执行的逻辑，你需要查看每个作用域（即函数）的实现细节，或者执行这些函数并观察对数据库对象（`gorm.DB`）的操作影响。通常，你需要在开发过程中通过调试或记录日志的方式来检查这些作用域函数如何修改数据库查询。
+
+## 也就是说这句代码是把两个dao.Scope和一个*gorm.DB给append进去了一个[]dao.Scope切片里面，这是什么意思，这样的作法有什么意义吗？
+
+确切地说，这段代码的含义是在一个 `[]dao.Scope` 切片里添加多个 `dao.Scope` 函数。这些 `dao.Scope` 函数在被添加时封装了对数据库查询（`*gorm.DB`）的特定操作。每个 `dao.Scope` 函数都是一个能接受 `*gorm.DB` 类型并返回修改后的 `*gorm.DB` 实例的闭包函数。在 GORM（一个Go语言的ORM框架）中，这种模式通常用于动态构建查询。
+
+这样的作法有几个意义和好处：
+
+1. **模块化和复用**：
+   - 通过定义可重用的 `dao.Scope` 函数，可以在不同的查询中重用相同的查询逻辑，而无需重写代码。这提高了代码的模块性和可维护性。
+
+2. **动态查询构建**：
+   - 在运行时根据条件动态添加或修改查询。这是非常有用的，特别是在构建需要根据多个不同输入参数决定其行为的复杂查询时。
+
+3. **隔离和封装**：
+   - 将数据库操作逻辑封装在单独的函数中，有助于隔离不同部分的代码，使得每部分更专注于其职责，从而减少了错误和复杂性。
+
+4. **链式调用和流畅接口**：
+   - GORM 使用这种方式可以使得调用链式方法构建查询更加直观和简洁。比如，你可以链式调用多个 `Scope` 方法来逐步构建查询，每个 `Scope` 增加一个查询条件或者修改查询的行为。
+
+在这段代码中，通过 `append` 函数把这些 `dao.Scope` 函数添加到 `scopes` 切片中，最终生成的 `searchListScopes` 包含所有这些作用域，这个切片后续可以被用于执行数据库查询，实现根据不同的搜索条件（如联结其他表、预加载数据等）来获取数据。
+
+
+## 可是func (n *NoteOrderSearchWrapper) GormSearch() func(db *gorm.DB) gorm.DB {}返回的是gorm.DB，但是JoinNoteInfoWithScopes和PreLoadThirdRequestsWithScopes函数返回的都是dao.Scope
+
+谢谢你的指正！让我澄清一下这些不同函数返回值的具体作用及其在代码中的角色。
+
+在你提到的代码中，`GormSearch`、`JoinNoteInfoWithScopes` 和 `PreLoadThirdRequestsWithScopes` 函数都应返回 `dao.Scope`。在 Go 语言的 GORM 使用上下文中，`dao.Scope` 类型实际上是一个函数类型，它通常定义为一个接收 `*gorm.DB` 并返回 `*gorm.DB` 的函数。这些函数使得可以对数据库查询进行链式调用和修改，从而添加各种过滤条件、联结表、预加载数据等操作。
+
+这里的函数返回值解释如下：
+
+1. **GormSearch**：
+   - `GormSearch` 函数属于 `NoteOrderSearchWrapper` 类型，它构建并返回一个 `dao.Scope`，这个 `dao.Scope` 通常是根据 `NoteOrderSearchWrapper` 中定义的字段和条件动态构建 SQL 查询的函数。
+
+2. **JoinNoteInfoWithScopes**：
+   - `JoinNoteInfoWithScopes` 函数可能属于 `NoteOrderDao` 类型，它接收一个或多个 `dao.Scope`（通过 `GormSearchOnFieldName` 生成的），用于构建需要联结 `NoteInfo` 表的查询。它也返回一个 `dao.Scope`，这个 `dao.Scope` 将包含 SQL 语句中必要的联结操作。
+
+3. **PreLoadThirdRequestsWithScopes**：
+   - `PreLoadThirdRequestsWithScopes` 函数同样属于 `NoteOrderDao` 类型，它用于预加载与订单相关的第三方请求数据的 `dao.Scope`。此函数的目的是构建预加载第三方请求数据的查询部分，以优化关联数据加载和处理效率。
+
+在这段代码中，`searchListScopes := append(scopes, ...)` 通过 `append` 函数将这些不同的 `dao.Scope` 加入到 `scopes` 切片中，形成一个包含所有这些作用域的列表。这个列表可以用于执行复杂的数据库查询，其中包含多种动态构建的查询条件和操作，如过滤、排序、联结表、预加载数据等。这种方法提高了代码的灵活性和查询的效率，同时使得查询构建更加模块化和可维护。
+
+
+
+## 阅读下面这段代码：
+
+```go
+// JoinNoteInfoWithScopes 拼接 NoteInfo 表并携带凭借条件，拼接条件会放在 order left join note on 条件中
+func (w NoteOrderDao) JoinNoteInfoWithScopes(scopes ...commondao.Scope) commondao.Scope {
+	return func(tx *gorm.DB) *gorm.DB {
+		db := w.DB()
+
+		for _, scope := range scopes {
+			db = scope(db)
+		}
+
+		return tx.InnerJoins(tradedb.TNoteOrderColumn.NoteInfo, db)
+	}
+}
+
+// PreLoadThirdRequestsWithScopes Preload ThirdRequests
+func (w NoteOrderDao) PreLoadThirdRequestsWithScopes(scopes ...commondao.Scope) commondao.Scope {
+	return func(tx *gorm.DB) *gorm.DB {
+		db := w.DB()
+
+		for _, scope := range scopes {
+			db = scope(db)
+		}
+
+		return tx.Preload(tradedb.TNoteOrderColumn.ThirdRequests, db)
+	}
+}
+```
+
+感谢你提供这段代码，它有助于更深入地理解 `JoinNoteInfoWithScopes` 和 `PreLoadThirdRequestsWithScopes` 这两个函数的具体实现及其作用。
+
+### JoinNoteInfoWithScopes
+这个函数接收一个或多个 `commondao.Scope` 类型的参数，这些参数本质上是修改数据库查询的函数。`JoinNoteInfoWithScopes` 函数的作用是将 `NoteInfo` 表通过内连接（Inner Join）加入到当前的查询中。具体步骤如下：
+- 首先，从 `w.DB()` 获取当前的数据库连接 `db`。
+- 然后，遍历传入的所有作用域（`scopes`），每个作用域都会以 `db` 作为输入，并返回一个更新后的 `db`。这允许链式添加多个查询条件或修改。
+- 最后，使用 `InnerJoins` 方法在传入的事务 `tx` 上添加一个内连接操作，连接条件由更新后的 `db` 提供。
+
+### PreLoadThirdRequestsWithScopes
+此函数同样接收一组 `commondao.Scope`，并用于预加载与 `ThirdRequests` 相关的数据。预加载是 ORM（对象关系映射）中的一个常见技术，用于在单次查询中加载关联对象，从而避免在访问关联对象时产生额外的查询。操作步骤如下：
+- 从 `w.DB()` 获取初始的数据库连接 `db`。
+- 遍历传入的作用域，每个作用域更新 `db`。
+- 使用 `Preload` 方法在传入的事务 `tx` 上预加载 `ThirdRequests` 表，条件由更新后的 `db` 指定。
+
+通过这种方式，`JoinNoteInfoWithScopes` 和 `PreLoadThirdRequestsWithScopes` 允许构建复杂的查询操作，包括内连接和预加载，同时还能够动态地添加多个条件或修改。这增强了查询的灵活性和性能，特别是在处理涉及多个表和复杂关系的大型数据库时。
+
+## type Scope func(*gorm.DB) *gorm.DB
+
+感谢你的补充。根据你提供的类型定义，`Scope` 是一个函数类型，接受一个 `*gorm.DB` 参数并返回一个 `*gorm.DB`。这一类型定义确实是非常常见的用于 GORM 中的查询构建模式。让我们结合你之前提供的 `JoinNoteInfoWithScopes` 和 `PreLoadThirdRequestsWithScopes` 函数来详细解释一下它们的工作原理和意义。
+
+### Scope 类型
+```go
+type Scope func(*gorm.DB) *gorm.DB
+```
+这个类型定义表明 `Scope` 是一种可以操作 `*gorm.DB` 的函数。这种函数类型允许我们创建高度可复用的数据库查询操作，具体来说，它们可以用来动态地添加查询条件、连接表、预加载关联等。
+
+### JoinNoteInfoWithScopes 和 PreLoadThirdRequestsWithScopes 的工作原理
+
+#### JoinNoteInfoWithScopes
+这个函数接受一组 `Scope` 函数，并返回一个新的 `Scope` 函数。该函数在内部构建了一个内连接（Inner Join）操作，同时应用了所有传入的 `Scope` 函数。
+
+```go
+func (w NoteOrderDao) JoinNoteInfoWithScopes(scopes ...commondao.Scope) commondao.Scope {
+    return func(tx *gorm.DB) *gorm.DB {
+        db := w.DB() // 获取当前的数据库连接
+
+        for _, scope := range scopes {
+            db = scope(db) // 应用每个传入的作用域
+        }
+
+        return tx.InnerJoins(tradedb.TNoteOrderColumn.NoteInfo, db) // 内连接操作
+    }
+}
+```
+- **获取数据库连接**：`db := w.DB()`
+- **应用所有作用域**：遍历 `scopes` 并将每个 `scope` 应用于 `db`，更新 `db` 对象。
+- **内连接操作**：在传入的事务 `tx` 上添加内连接操作，连接条件由应用了所有作用域后的 `db` 提供。
+
+#### PreLoadThirdRequestsWithScopes
+这个函数的逻辑与 `JoinNoteInfoWithScopes` 类似，但它是用于预加载关联数据。
+
+```go
+func (w NoteOrderDao) PreLoadThirdRequestsWithScopes(scopes ...commondao.Scope) commondao.Scope {
+    return func(tx *gorm.DB) *gorm.DB {
+        db := w.DB() // 获取当前的数据库连接
+
+        for _, scope := range scopes {
+            db = scope(db) // 应用每个传入的作用域
+        }
+
+        return tx.Preload(tradedb.TNoteOrderColumn.ThirdRequests, db) // 预加载操作
+    }
+}
+```
+- **获取数据库连接**：`db := w.DB()`
+- **应用所有作用域**：遍历 `scopes` 并将每个 `scope` 应用于 `db`，更新 `db` 对象。
+- **预加载操作**：在传入的事务 `tx` 上添加预加载操作，条件由应用了所有作用域后的 `db` 提供。
+
+### 综合分析
+`searchListScopes := append(scopes, s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo)), s.NoteOrderDao.PreLoadThirdRequestsWithScopes(), orderWrapper.GormSearch())`
+
+这句代码通过将多个 `Scope` 函数追加到 `scopes` 切片中，构建了一个复杂的查询条件集。以下是每个部分的具体含义：
+
+1. **`scopes`**：这是初始的查询条件集合。
+2. **`s.NoteOrderDao.JoinNoteInfoWithScopes(orderNoteInfoWrapper.GormSearchOnFieldName(tradedb.TNoteOrderColumn.NoteInfo))`**：
+   - 这是一个 `Scope`，它通过内连接操作将 `NoteInfo` 表加入查询，并应用 `orderNoteInfoWrapper.GormSearchOnFieldName` 返回的所有作用域。
+3. **`s.NoteOrderDao.PreLoadThirdRequestsWithScopes()`**：
+   - 这是一个 `Scope`，它预加载 `ThirdRequests` 表的数据。
+4. **`orderWrapper.GormSearch()`**：
+   - 这是一个 `Scope`，它应用 `orderWrapper` 中定义的所有查询条件。
+
+通过这种方式，`searchListScopes` 包含了所有需要的查询条件、内连接和预加载操作，最终构成了一个完整的查询操作。这个方法使得查询构建更为灵活和模块化，可以根据不同的需求动态地组合各种查询条件和操作。
+
+## 所以searchListScopes 的值是什么样子的呢
+
+`searchListScopes` 的值是一个包含多个 `Scope` 函数的切片。每个 `Scope` 函数都是一个可以接受 `*gorm.DB` 类型并返回 `*gorm.DB` 类型的函数，这些函数定义了如何修改数据库查询。
+
+具体来说，`searchListScopes` 是 `[]Scope` 类型，其中每个 `Scope` 函数的实际内容可能如下：
+
+1. **初始的 `scopes` 切片中的作用域**：
+   - 这些作用域是最初添加的，用于构建基本查询条件。
+
+2. **`JoinNoteInfoWithScopes` 函数返回的作用域**：
+   - 这是一个 `Scope` 函数，它通过内连接操作将 `NoteInfo` 表加入查询，并应用 `orderNoteInfoWrapper.GormSearchOnFieldName` 返回的所有作用域。
+   - 具体实现是一个函数，这个函数接受一个 `*gorm.DB`，应用所有 `scopes` 后，返回添加了内连接操作的 `*gorm.DB`。
+
+3. **`PreLoadThirdRequestsWithScopes` 函数返回的作用域**：
+   - 这是一个 `Scope` 函数，它预加载 `ThirdRequests` 表的数据。
+   - 具体实现是一个函数，这个函数接受一个 `*gorm.DB`，应用所有 `scopes` 后，返回添加了预加载操作的 `*gorm.DB`。
+
+4. **`orderWrapper.GormSearch` 函数返回的作用域**：
+   - 这是一个 `Scope` 函数，它应用 `orderWrapper` 中定义的所有查询条件。
+   - 具体实现是一个函数，这个函数接受一个 `*gorm.DB`，应用 `orderWrapper` 中定义的查询条件后，返回修改后的 `*gorm.DB`。
+
+### 示例
+假设有以下几个简单的 `Scope` 函数：
+
+```go
+func scope1(db *gorm.DB) *gorm.DB {
+    return db.Where("field1 = ?", "value1")
+}
+
+func scope2(db *gorm.DB) *gorm.DB {
+    return db.Where("field2 = ?", "value2")
+}
+
+func joinScope(db *gorm.DB) *gorm.DB {
+    return db.Joins("INNER JOIN note_info ON note_info.order_id = orders.id")
+}
+
+func preloadScope(db *gorm.DB) *gorm.DB {
+    return db.Preload("ThirdRequests")
+}
+```
+
+那么 `searchListScopes` 的值类似于：
+
+```go
+searchListScopes := []Scope{
+    scope1,      // 这是从初始的 scopes 切片中来的作用域
+    scope2,      // 也是从初始的 scopes 切片中来的作用域
+    joinScope,   // 这是 JoinNoteInfoWithScopes 返回的作用域
+    preloadScope // 这是 PreLoadThirdRequestsWithScopes 返回的作用域
+}
+```
+
+每个 `Scope` 都是一个函数，可以应用于 `*gorm.DB` 实例来修改查询。最终构建查询时，可以像这样依次应用这些作用域：
+
+```go
+db := gorm.DB{} // 假设这是一个 GORM 数据库连接实例
+for _, scope := range searchListScopes {
+    db = scope(db)
+}
+```
+
+这样做的结果是，`db` 最终会包含所有这些作用域应用后的查询条件。每个作用域函数都对 `db` 进行了修改，添加了相应的查询条件、联接或预加载操作。
+
+## 阅读这段NoteOrderExtraInfoSearchWrapper的GormSearchOnFieldName函数：
+```go
+func (n *NoteOrderExtraInfoSearchWrapper) GormSearchOnFieldName(fieldName string) func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		if len(n.SearchFields) > 0 {
+			db = db.Select(n.SearchFields)
+		}
+		if n.LikeIsin.Valid {
+			db = db.Where(fieldName+".isin like ?", "%"+n.LikeIsin.ValueOrZero()+"%")
+		}
+		if n.LikeProductName.Valid {
+			db = db.Where(fieldName+".productName like ?", "%"+n.LikeProductName.ValueOrZero()+"%")
+		}
+		if n.LikeProductCode.Valid {
+			db = db.Where(fieldName+".productCode like ?", "%"+n.LikeProductCode.ValueOrZero()+"%")
+		}
+		if n.LikeIdentifyingCode.Valid {
+			db = db.Where(fieldName+"identifyingCode like ?", "%"+n.LikeIdentifyingCode.ValueOrZero()+"%")
+		}
+		if len(n.Id) > 0 {
+			db = db.Where(fieldName+".id in ?", n.Id)
+		}
+		if n.GtId.Valid {
+			db = db.Where(fieldName+".id > ?", n.GtId.Int64)
+		}
+		if len(n.ProductTypes) > 0 {
+			db = db.Where(fieldName+".productType in ?", n.ProductTypes)
+		}
+		if n.ProductType != 0 {
+			db = db.Where(fieldName+".productType = ?", n.ProductType)
+		}
+		if len(n.ProductCodes) > 0 {
+			db = db.Where(fieldName+".productCode in ?", n.ProductCodes)
+		}
+		if n.NoteInterestRateType.Valid {
+			db = db.Where(fieldName+".noteInterestRateType = ?", n.NoteInterestRateType.ValueOrZero())
+		}
+		if n.ProductCodeNull.Valid && n.ProductCodeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".productCode is null")
+		}
+		if n.ProductCodeNull.Valid && !n.ProductCodeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".productCode is not null")
+		}
+		if n.IdentifyingCodeNull.Valid && n.IdentifyingCodeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".identifyingCode is null")
+		}
+		if n.IdentifyingCodeNull.Valid && !n.IdentifyingCodeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".identifyingCode is not null")
+		}
+		if n.NoteInterestRateTypeNull.Valid && n.NoteInterestRateTypeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".noteInterestRateType is null")
+		}
+		if n.NoteInterestRateTypeNull.Valid && !n.NoteInterestRateTypeNull.ValueOrZero() {
+			db = db.Where(fieldName + ".noteInterestRateType is not null")
+		}
+
+		if n.Sort.Valid {
+			db = db.Order(n.Sort.ValueOrZero())
+		}
+
+		if n.Start > 0 {
+			db = db.Offset(n.Start)
+		}
+
+		if n.Count > 0 {
+			db = db.Limit(n.Count)
+		}
+		return db
+	}
+}
+```
+
+这个 `GormSearchOnFieldName` 函数是 `NoteOrderExtraInfoSearchWrapper` 结构体的一个方法，其作用是根据结构体内的各种条件生成一个用于查询数据库的 `Scope` 函数。该函数接受一个 `fieldName` 字符串参数，它指定了数据库查询中将用于引用字段的基础名称。这个 `fieldName` 通常是关联表的别名或是数据库表的名称。
+
+### 函数逻辑分析
+
+函数内部构建的 `Scope` 用于修改传入的 `*gorm.DB` 对象，添加多种查询条件。具体的条件包括：
+
+1. **Select Fields**: 如果 `SearchFields` 有值，将使用这些字段进行查询选择。
+   
+2. **Like Queries**: 为 `isin`、`productName`、`productCode` 和 `identifyingCode` 字段添加模糊搜索条件，如果对应的 `Valid` 属性为 `true`。
+
+3. **Exact Matches**:
+   - 对于 `id` 和 `productType` 字段，如果有具体的值，则添加查询条件。
+   - 对于 `productCode` 和 `productType`，如果它们的列表有值，使用 `IN` 语句添加查询条件。
+
+4. **Null Checks**: 检查特定字段是否为 `null` 或非 `null`，如 `productCode`、`identifyingCode` 和 `noteInterestRateType`。
+
+5. **Sorting, Pagination**: 如果指定了排序，则按 `Sort` 字段指定的方式排序。如果指定了 `Start`（起始位置）和 `Count`（数量限制），则添加分页参数。
+
+### 代码中的具体操作
+
+- **字段定位**：所有的查询条件都基于 `fieldName` 进行，这意味着可以将这个函数应用于任何表的任何字段，只要传入正确的字段名即可。
+
+- **模糊搜索** (`LIKE`)：对于 `LikeIsin`、`LikeProductName`、`LikeProductCode`、`LikeIdentifyingCode` 等属性，它们使用 `LIKE` 语句进行模糊匹配。
+
+- **列表查询** (`IN`)：对于 `Id` 和 `ProductTypes` 等属性，如果它们的数组长度大于0，则使用 `IN` 语句。
+
+- **空值检查** (`IS NULL` / `IS NOT NULL`)：对于如 `ProductCodeNull` 和 `IdentifyingCodeNull` 的属性，根据它们的 `Valid` 和布尔值来决定使用 `IS NULL` 或 `IS NOT NULL`。
+
+- **排序和分页**：根据 `Sort`、`Start` 和 `Count` 属性来决定查询的排序和分页方式。
+
+这个方法通过将所有这些条件动态地加入到传入的 `gorm.DB` 实例中，极大地提升了查询的灵活性和动态性，使得可以根据不同的需求构建针对性的数据库查询。这种方式非常适合于构建复杂的多条件查询，尤其是在处理大量数据和需要高度定制化查询的应用场景中。
