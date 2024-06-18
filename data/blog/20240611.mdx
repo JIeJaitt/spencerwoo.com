@@ -1,7 +1,91 @@
 ---
-title: '🔮 Golang结构体报错'
+title: '🔮 优化钉钉告警类型根据 fundType 来判断'
 date: 2024-04-12T17:34:56+0800
-tags: ['vision', 'research']
+tags: ['golang', 'research']
 draft: false
-summary: Hooks.
+summary: 这段代码如何写的更加优雅
 ---
+
+这段代码如何写的更加优雅：
+```go
+// sendDingTalkAlertNoOrders 当日查询不到订单时钉钉告警
+func (t *Worker) sendDingTalkAlertNoOrders(ctx context.Context, fundType string) {
+	var content string
+	if fundType == constant.WorkerArgFundTypeMonetary {
+		content = fmt.Sprintf(
+			"%s 今天没有产生任何货币基金订单，请及时关注",
+			env.GetSquareBracketsEnv(), fundType,
+		)
+	} else {
+		content = fmt.Sprintf(
+			"%s 今天没有产生任何非货币基金订单，请及时关注",
+			env.GetSquareBracketsEnv(), fundType,
+		)
+	}
+
+	t.dingTalkRestyClient.DingTalkRobotSendMsg(ctx,
+		viper.GetString("dependence.dingTalkFundTask.accessToken"),
+		viper.GetString("dependence.dingTalkFundTask.secret"),
+		dingtalkmapping.DingTalkSendMsgRequest{
+			Content: content,
+		},
+	)
+}
+```
+
+要使这段 Go 代码更加优雅，你可以考虑以下几点优化：
+
+1. **简化消息内容构建逻辑**：通过提前设置消息模板，减少冗余代码。
+2. **使用内联条件表达式**：这在 Go 中不直接支持，但可以通过小函数来实现类似效果。
+3. **封装配置获取逻辑**：简化 `DingTalkRobotSendMsg` 方法调用中的参数获取。
+4. **增强代码可读性**：添加一些注释来描述关键步骤，使代码更易理解。
+
+这是优化后的代码示例：
+
+```go
+// sendDingTalkAlertNoOrders alerts via DingTalk when no orders are found for the day.
+func (t *Worker) sendDingTalkAlertNoOrders(ctx context.Context, fundType string) {
+    // Choose the appropriate message template based on the fund type.
+    messageType := map[bool]string{true: "货币基金", false: "非货币基金"}[fundType == constant.WorkerArgFundTypeMonetary]
+    content := fmt.Sprintf(
+        "%s 今天没有产生任何%s订单，请及时关注",
+        env.GetSquareBracketsEnv(), messageType,
+    )
+
+    // Fetch DingTalk configuration from environment or config file.
+    accessToken := viper.GetString("dependence.dingTalkFundTask.accessToken")
+    secret := viper.GetString("dependence.dingTalkFundTask.secret")
+
+    // Send message using DingTalk client.
+    t.dingTalkRestyClient.DingTalkRobotSendMsg(ctx, accessToken, secret, dingtalkmapping.DingTalkSendMsgRequest{
+        Content: content,
+    })
+}
+```
+
+这个重构版本利用了 Go 的映射来选择消息类型，减少了原有的 if-else 条件判断，使函数更为精简。同时，将配置项直接在调用时获取，减少了代码的复杂度，并使函数的调用更为清晰。
+
+当然可以，这是带有中文注释的优化后的代码：
+
+```go
+// sendDingTalkAlertNoOrders 当日无订单时通过钉钉发送警告。
+func (t *Worker) sendDingTalkAlertNoOrders(ctx context.Context, fundType string) {
+    // 根据基金类型选择适当的消息模板。
+    messageType := map[bool]string{true: "货币基金", false: "非货币基金"}[fundType == constant.WorkerArgFundTypeMonetary]
+    content := fmt.Sprintf(
+        "%s 今天没有产生任何%s订单，请及时关注",
+        env.GetSquareBracketsEnv(), messageType,
+    )
+
+    // 从环境变量或配置文件中获取钉钉配置。
+    accessToken := viper.GetString("dependence.dingTalkFundTask.accessToken")
+    secret := viper.GetString("dependence.dingTalkFundTask.secret")
+
+    // 使用钉钉客户端发送消息。
+    t.dingTalkRestyClient.DingTalkRobotSendMsg(ctx, accessToken, secret, dingtalkmapping.DingTalkSendMsgRequest{
+        Content: content,
+    })
+}
+```
+
+这个版本的代码使用了映射来选择消息类型，通过键值对的方式简化了条件逻辑，使得代码更加简洁易读。同时，配置的获取直接在方法调用中进行，提高了代码的可读性和易维护性。
